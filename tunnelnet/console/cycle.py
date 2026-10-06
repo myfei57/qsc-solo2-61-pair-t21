@@ -34,7 +34,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
 
     rt.patrol.check_in(cabin_id, at)
 
-    usage = rt.quota.add_usage(cabin_id, watts)
+    usage = rt.quota.add_usage(cabin_id, watts, at=at)
 
     rt.drain.start_drain(cabin_id)
     rt.drain.record_cycle(cabin_id, at)

@@ -37,6 +37,8 @@ def seed_defaults(rt: Runtime) -> None:
     rt.power_book.set_baseline("cabin-1", 4200.0)
     rt.power_book.set_baseline("cabin-2", 3800.0)
     rt.power_book.set_baseline("cabin-3", 4600.0)
+    for cabin_id, watts in (("cabin-1", 4200.0), ("cabin-2", 3800.0), ("cabin-3", 4600.0)):
+        rt.quota.seed_baseline(cabin_id, watts)
 
     rt.cables.add(Cable(id="cable-1", cabin="cabin-1", temp=42.0))
     rt.cables.add(Cable(id="cable-2", cabin="cabin-2", temp=46.0))
@@ -46,8 +48,10 @@ def seed_defaults(rt: Runtime) -> None:
     rt.env.sample("sensor-2", 55.0, SEED_AT)
     rt.patrol.check_in("cabin-1", SEED_AT)
     rt.patrol.set_due("cabin-2", "2025-12-31T00:00:00Z")
-    rt.quota.add_usage("cabin-1", 1200.0)
-    rt.quota.add_usage("cabin-2", 900.0)
+    # Seed usage is attributed to a fixed, finished shift so it demonstrates
+    # frozen historical attribution without landing in the live clock shift.
+    rt.quota.add_usage("cabin-1", 1200.0, at=SEED_AT)
+    rt.quota.add_usage("cabin-2", 900.0, at=SEED_AT)
     rt.drain.record_cycle("cabin-1", SEED_AT)
     rt.drain.record_cycle("cabin-1", SEED_AT)
     rt.cables.sample("cable-1", 42.0)

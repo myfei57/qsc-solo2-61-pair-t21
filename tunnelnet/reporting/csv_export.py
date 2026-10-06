@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from tunnelnet.audit import AuditRegistry
+from tunnelnet.quota import QuotaService, attribution_rows
 from tunnelnet.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
@@ -49,3 +50,36 @@ def telemetry_export(telemetry: Telemetry) -> tuple[list[str], list[list[object]
     """Columns and rows for the telemetry counters."""
 
     return ["metric", "value"], [[key, value] for key, value in telemetry.as_dict().items()]
+
+
+def quota_attribution_export(
+    quota: QuotaService, shift_label: str = ""
+) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows for one shift's baseline, usage and overage."""
+
+    columns = ["shift_label", "cabin_id", "baseline_watts", "usage_watts", "overage_watts", "baseline_batch"]
+    rows = [
+        [
+            row.shift_label,
+            row.cabin_id,
+            row.baseline_watts,
+            row.usage_watts,
+            row.overage_watts,
+            row.batch_id,
+        ]
+        for row in attribution_rows(quota, shift_label)
+    ]
+    return columns, rows
+
+
+def quota_allocation_export(
+    quota: QuotaService, shift_label: str = ""
+) -> tuple[list[str], list[list[object]]]:
+    """Columns and rows for the winning baseline of every cabin in a shift."""
+
+    columns = ["shift_label", "cabin_id", "watts", "batch_id", "seq"]
+    rows = [
+        [allocation.shift_label, allocation.cabin_id, allocation.watts, allocation.batch_id, allocation.seq]
+        for allocation in quota.allocation_rows(shift_label)
+    ]
+    return columns, rows

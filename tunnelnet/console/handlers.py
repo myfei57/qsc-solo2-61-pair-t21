@@ -11,7 +11,14 @@ from tunnelnet.drain import Pit
 from tunnelnet.env import snapshot as env_snapshot
 from tunnelnet.fire import Detector
 from tunnelnet.ns import Stage, control_chain
-from tunnelnet.reporting import audit_export, telemetry_export, to_csv
+from tunnelnet.reporting import (
+    audit_export,
+    quota_allocation_export,
+    quota_attribution_export,
+    telemetry_export,
+    to_csv,
+)
+from tunnelnet.quota import attribution_rows
 from tunnelnet.reporting import store_export as store_csv_export
 from tunnelnet.store import export_all, export_kind, list_approvals, revoke_approval, summarize
 
@@ -606,9 +613,11 @@ def cable_sample(server: "Server", request: Request) -> Response:
 
 def quota_report(server: "Server", request: Request) -> Response:
     quota = server.runtime.quota
+    shift_label = request.query_field("shift") or quota.current_shift_label()
     return json_response(
         {
-            "items": [baseline.as_dict() for baseline in quota.load_report()],
+            "shift_label": shift_label,
+            "items": [baseline.as_dict() for baseline in quota.load_report(shift_label)],
             "book_cabins": server.runtime.power_book.cabins(),
         }
     )
@@ -616,13 +625,16 @@ def quota_report(server: "Server", request: Request) -> Response:
 
 def quota_usage(server: "Server", request: Request) -> Response:
     quota = server.runtime.quota
+    shift_label = request.query_field("shift") or quota.current_shift_label()
     return json_response(
         {
-            "usage": quota.usage_by_cabin(),
-            "total": quota.total_usage(),
-            "peak": quota.peak(),
-            "ranked": quota.ranked_cabin_ids(),
-            "baseline": [baseline.as_dict() for baseline in quota.load_report()],
+            "shift_label": shift_label,
+            "usage": quota.usage_by_cabin(shift_label),
+            "total": quota.total_usage(shift_label),
+            "peak": quota.peak(shift_label),
+            "ranked": quota.ranked_cabin_ids(shift_label),
+            "baseline": [baseline.as_dict() for baseline in quota.load_report(shift_label)],
+            "attributed": [event.as_dict() for event in quota.attributed_usage(shift_label)],
         }
     )
 
@@ -632,31 +644,97 @@ def quota_advanced(server: "Server", request: Request) -> Response:
     cabin_id = request.query_field("cabin")
     factor = request.query_field("factor")
     scale = float(factor) if factor else 1.0
+    shift_label = request.query_field("shift") or quota.current_shift_label()
     return json_response(
         {
-            "allocated": quota.allocated(),
-            "overage_total": quota.overage_total(),
-            "peak_cabin": quota.peak_cabin(),
-            "forecast": quota.forecast(cabin_id, scale),
-            "overage": quota.overage(cabin_id),
+            "shift_label": shift_label,
+            "allocated": quota.allocated(shift_label),
+            "overage_total": quota.overage_total(shift_label),
+            "peak_cabin": quota.peak_cabin(shift_label),
+            "forecast": quota.forecast(cabin_id, scale, shift_label),
+            "overage": quota.overage(cabin_id, shift_label),
         }
     )
 
 
 def quota_summary(server: "Server", request: Request) -> Response:
-    return json_response(server.runtime.quota.report().as_dict())
+    quota = server.runtime.quota
+    shift_label = request.query_field("shift") or quota.current_shift_label()
+    return json_response(quota.report(shift_label).as_dict())
 
 
 def quota_refresh(server: "Server", request: Request) -> Response:
-    items = server.runtime.quota.refresh_baseline(request.float_field("watts"))
-    return json_response({"items": [baseline.as_dict() for baseline in items]})
+    quota = server.runtime.quota
+    at = request.str_field("at") or None
+    items = quota.refresh_baseline(request.float_field("watts"), at=at)
+    return json_response(
+        {
+            "shift_label": quota.current_shift_label(at),
+            "effective_shift": quota.next_shift_label(at),
+            "items": [baseline.as_dict() for baseline in items],
+        }
+    )
+
+
+def quota_allocate(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    raw_items = request.object_list("items")
+    if not raw_items:
+        raise RequestError(400, "items is required")
+    items = []
+    for raw in raw_items:
+        cabin_id = raw.get("cabin_id")
+        if not isinstance(cabin_id, str) or not cabin_id:
+            raise RequestError(400, "every item needs a cabin_id")
+        watts = raw.get("watts", 0.0)
+        if isinstance(watts, bool) or not isinstance(watts, (int, float)):
+            raise RequestError(400, "every item needs numeric watts")
+        items.append((cabin_id, float(watts)))
+    idempotency_key = request.str_field("idempotency_key")
+    if not idempotency_key:
+        raise RequestError(400, "idempotency_key is required")
+    batch = quota.submit_allocation(
+        items,
+        idempotency_key=idempotency_key,
+        at=request.str_field("at") or None,
+        requested_by=request.str_field("requested_by", "operator"),
+        target_shift=request.str_field("target_shift"),
+    )
+    return json_response(
+        {
+            "batch_id": batch.id,
+            "effective_shift": batch.shift_label,
+            "items": [{"cabin_id": cabin_id, "watts": watts} for cabin_id, watts in batch.items],
+        }
+    )
+
+
+def quota_batches(server: "Server", request: Request) -> Response:
+    batches = server.runtime.quota.batches()
+    return json_response({"items": [batch.as_dict() for batch in batches], "count": len(batches)})
+
+
+def quota_attribution(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    shift_label = request.query_field("shift") or quota.current_shift_label()
+    rows = attribution_rows(quota, shift_label)
+    return json_response({"shift_label": shift_label, "items": [row.as_dict() for row in rows]})
 
 
 def quota_add_usage(server: "Server", request: Request) -> Response:
-    usage = server.runtime.quota.add_usage(
-        request.str_field("cabin_id"), request.float_field("watts")
+    quota = server.runtime.quota
+    at = request.str_field("at") or None
+    shift_label = quota.current_shift_label(at)
+    usage = quota.add_usage(request.str_field("cabin_id"), request.float_field("watts"), at=at)
+    cabin_id = request.str_field("cabin_id")
+    return json_response(
+        {
+            "shift_label": shift_label,
+            "usage": usage,
+            "baseline_watts": quota.baseline_watts(cabin_id, shift_label),
+            "overage": quota.overage(cabin_id, shift_label),
+        }
     )
-    return json_response({"usage": usage})
 
 
 def audit_list(server: "Server", request: Request) -> Response:
@@ -773,4 +851,18 @@ def export_telemetry(server: "Server", request: Request) -> Response:
 
 def export_store(server: "Server", request: Request) -> Response:
     columns, rows = store_csv_export(server.runtime.store)
+    return csv_response(to_csv(columns, rows))
+
+
+def export_quota_attribution(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    shift_label = request.query_field("shift") or quota.current_shift_label()
+    columns, rows = quota_attribution_export(quota, shift_label)
+    return csv_response(to_csv(columns, rows))
+
+
+def export_quota_allocation(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    shift_label = request.query_field("shift") or quota.current_shift_label()
+    columns, rows = quota_allocation_export(quota, shift_label)
     return csv_response(to_csv(columns, rows))

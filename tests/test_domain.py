@@ -68,7 +68,18 @@ from tunnelnet.ns import Chain
 from tunnelnet.ns import Registry as NamespaceRegistry
 from tunnelnet.ns import Stage, control_chain
 from tunnelnet.patrol import CheckIn, PatrolService, overdue_cabins, progress_ratio
-from tunnelnet.quota import QuotaService, baseline_report, overage_for, peak, rank, total
+from tunnelnet.quota import (
+    QuotaConflict,
+    QuotaService,
+    ShiftCalendar,
+    attribution_rows,
+    baseline_report,
+    overage_for,
+    parse_instant,
+    peak,
+    rank,
+    total,
+)
 from tunnelnet.reporting import audit_export, store_export, telemetry_export, to_csv
 from tunnelnet.store import (
     Approval,
@@ -612,35 +623,132 @@ class CableCase(unittest.TestCase):
 
 
 class QuotaCase(unittest.TestCase):
-    def test_baselines_usage_and_overage(self) -> None:
+    def _service(self) -> tuple[QuotaService, PowerBook]:
         cabins = CabinRegistry()
         cabins.upsert(Cabin(id="cabin-1"))
         cabins.upsert(Cabin(id="cabin-2"))
         book = PowerBook()
         quota = QuotaService(cabins, book)
+        quota.seed_baseline("cabin-1", 100.0)
+        quota.seed_baseline("cabin-2", 100.0)
+        return quota, book
 
-        baselines = quota.refresh_baseline(100.0)
+    def test_baselines_usage_and_overage(self) -> None:
+        quota, book = self._service()
+        day = "2026-10-05#0"
+        night = "2026-10-05#1"
+
+        baselines = quota.load_report(day)
         self.assertEqual([item.watts for item in baselines], [100.0, 100.0])
-        self.assertEqual(book.baseline("cabin-1"), 100.0)
-        self.assertEqual([item.cabin_id for item in baseline_report(cabins, book)], ["cabin-1", "cabin-2"])
+        self.assertEqual(quota.baseline_watts("cabin-1", day), 100.0)
+        self.assertEqual([item.cabin_id for item in baseline_report(quota, day)], ["cabin-1", "cabin-2"])
 
-        self.assertEqual(quota.add_usage("cabin-1", 40.0), 40.0)
-        self.assertEqual(quota.add_usage("cabin-1", 80.0), 120.0)
-        quota.add_usage("cabin-2", 50.0)
-        self.assertEqual(quota.usage("cabin-1"), 120.0)
-        self.assertEqual(quota.total_usage(), 170.0)
-        self.assertEqual(quota.peak(), 120.0)
-        self.assertEqual(quota.usage_by_cabin(), {"cabin-1": 120.0, "cabin-2": 50.0})
-        self.assertEqual(quota.ranked_cabin_ids(), ["cabin-1", "cabin-2"])
-        self.assertEqual(quota.overage("cabin-1"), 20.0)
-        self.assertEqual(quota.overage("cabin-2"), 0.0)
-        self.assertEqual(quota.allocated(), 200.0)
-        self.assertEqual(quota.overage_total(), 20.0)
-        self.assertEqual(quota.forecast("cabin-1", 2.0), 240.0)
-        self.assertEqual(quota.peak_cabin(), "cabin-1")
-        report = quota.report()
-        self.assertEqual(report.as_dict()["cabins"], 2)
+        # Usage in the day shift is attributed to the standing baseline.
+        self.assertEqual(quota.add_usage("cabin-1", 40.0, at="2026-10-05T10:00:00Z"), 40.0)
+        self.assertEqual(quota.add_usage("cabin-1", 80.0, at="2026-10-05T11:00:00Z"), 120.0)
+        quota.add_usage("cabin-2", 50.0, at="2026-10-05T12:00:00Z")
+        self.assertEqual(quota.usage("cabin-1", day), 120.0)
+        self.assertEqual(quota.total_usage(day), 170.0)
+        self.assertEqual(quota.peak(day), 120.0)
+        self.assertEqual(quota.usage_by_cabin(day), {"cabin-1": 120.0, "cabin-2": 50.0})
+        self.assertEqual(quota.ranked_cabin_ids(day), ["cabin-1", "cabin-2"])
+        self.assertEqual(quota.overage("cabin-1", day), 20.0)
+        self.assertEqual(quota.overage("cabin-2", day), 0.0)
+        self.assertEqual(quota.allocated(day), 200.0)
+        self.assertEqual(quota.overage_total(day), 20.0)
+        self.assertEqual(quota.forecast("cabin-1", 2.0, day), 240.0)
+        self.assertEqual(quota.peak_cabin(day), "cabin-1")
         self.assertIn("allocated=200.0000", quota.describe())
+
+        # The power book keeps the standing default for cabins with no ledger row.
+        self.assertEqual(book.baseline("cabin-1"), 100.0)
+
+        # Refresh allocates the next shift only and keeps history frozen.
+        items = quota.refresh_baseline(200.0, at="2026-10-05T12:00:00Z")
+        self.assertEqual({item.watts for item in items}, {200.0})
+        self.assertEqual(quota.baseline_watts("cabin-1", night), 200.0)
+        self.assertEqual(quota.baseline_watts("cabin-1", day), 100.0)
+        self.assertEqual(quota.overage_total(day), 20.0)
+        report = quota.report(day)
+        self.assertEqual(report.as_dict()["cabins"], 2)
+        self.assertEqual(report.shift_label, day)
+
+    def test_next_shift_effect_and_last_write_wins(self) -> None:
+        quota, _ = self._service()
+        submit_at = "2026-10-05T10:00:00Z"
+        night = "2026-10-05#1"
+
+        first = quota.submit_allocation(
+            [("cabin-1", 300.0)], idempotency_key="k1", at=submit_at
+        )
+        self.assertEqual(first.shift_label, night)
+        self.assertEqual(quota.baseline_watts("cabin-1", night), 300.0)
+
+        # A later adjustment for the same future shift wins.
+        quota.submit_allocation([("cabin-1", 450.0)], idempotency_key="k2", at=submit_at)
+        self.assertEqual(quota.baseline_watts("cabin-1", night), 450.0)
+
+        # Replaying k1 is idempotent and does not roll the value back.
+        replay = quota.submit_allocation([("cabin-1", 300.0)], idempotency_key="k1", at=submit_at)
+        self.assertEqual(replay.id, first.id)
+        self.assertEqual(quota.baseline_watts("cabin-1", night), 450.0)
+        self.assertEqual(len(quota.batches()), 2)
+
+        # The carried allocation keeps applying until a later one overrides it.
+        self.assertEqual(quota.baseline_watts("cabin-1", "2026-10-06#0"), 450.0)
+
+        # Targeting an already started shift is rejected.
+        with self.assertRaises(QuotaConflict):
+            quota.submit_allocation(
+                [("cabin-1", 1.0)],
+                idempotency_key="k3",
+                at="2026-10-05T21:30:00Z",
+                target_shift=night,
+            )
+
+    def test_batch_rollback_and_idempotency_conflict(self) -> None:
+        quota, _ = self._service()
+        before = len(quota.batches())
+        with self.assertRaises(QuotaConflict):
+            quota.submit_allocation(
+                [("cabin-1", 500.0), ("ghost", 1.0)],
+                idempotency_key="bad",
+                at="2026-10-05T10:00:00Z",
+            )
+        self.assertEqual(len(quota.batches()), before)
+
+        quota.submit_allocation([("cabin-1", 500.0)], idempotency_key="dup", at="2026-10-05T10:00:00Z")
+        with self.assertRaises(QuotaConflict):
+            quota.submit_allocation([("cabin-1", 501.0)], idempotency_key="dup", at="2026-10-05T10:00:00Z")
+
+    def test_usage_freezes_the_baseline_and_feeds_one_export_caliber(self) -> None:
+        quota, _ = self._service()
+        quota.submit_allocation([("cabin-1", 200.0)], idempotency_key="night", at="2026-10-05T10:00:00Z")
+        # Night usage is charged against 200; later adjustments cannot move it.
+        quota.add_usage("cabin-1", 260.0, at="2026-10-05T21:00:00Z")
+        quota.submit_allocation([("cabin-1", 50.0)], idempotency_key="later", at="2026-10-05T22:00:00Z")
+
+        night = "2026-10-05#1"
+        rows = {row.cabin_id: row for row in attribution_rows(quota, night)}
+        self.assertEqual(rows["cabin-1"].baseline_watts, 200.0)
+        self.assertEqual(rows["cabin-1"].usage_watts, 260.0)
+        self.assertEqual(rows["cabin-1"].overage_watts, 60.0)
+        event = quota.attributed_usage(night)[0]
+        self.assertEqual(event.baseline_watts, 200.0)
+
+        # The following shift sees the newest baseline; the past shift is intact.
+        self.assertEqual(quota.baseline_watts("cabin-1", "2026-10-06#0"), 50.0)
+        self.assertEqual(quota.overage_total(night), 60.0)
+
+    def test_shift_calendar_boundaries(self) -> None:
+        calendar = ShiftCalendar((8, 20))
+        self.assertEqual(calendar.shift_at(parse_instant("2026-10-05T07:59:00Z")).label, "2026-10-04#1")
+        self.assertEqual(calendar.shift_at(parse_instant("2026-10-05T08:00:00Z")).label, "2026-10-05#0")
+        self.assertEqual(calendar.shift_at(parse_instant("2026-10-05T19:59:00Z")).label, "2026-10-05#0")
+        self.assertEqual(calendar.shift_at(parse_instant("2026-10-05T20:00:00Z")).label, "2026-10-05#1")
+        self.assertEqual(calendar.next_shift(parse_instant("2026-10-05T10:00:00Z")).label, "2026-10-05#1")
+        self.assertEqual(calendar.next_shift(parse_instant("2026-10-05T20:00:00Z")).label, "2026-10-06#0")
+        self.assertTrue(calendar.has_started(calendar.parse_label("2026-10-05#1"), parse_instant("2026-10-05T20:00:00Z")))
 
     def test_peak_cabin_without_usage(self) -> None:
         quota = QuotaService(CabinRegistry(), PowerBook())

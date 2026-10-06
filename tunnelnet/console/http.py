@@ -16,6 +16,7 @@ STATUS_TEXT = {
     400: "Bad Request",
     404: "Not Found",
     405: "Method Not Allowed",
+    409: "Conflict",
     500: "Internal Server Error",
 }
 
@@ -132,6 +133,14 @@ class Request:
         if not isinstance(value, (list, tuple)):
             raise RequestError(400, f"field {name} must be a list of numbers")
         return [_to_float(name, item) for item in value]
+
+    def object_list(self, name: str) -> list[dict[str, object]]:
+        value = self.payload.get(name, [])
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple)) or not all(isinstance(item, dict) for item in value):
+            raise RequestError(400, f"field {name} must be a list of objects")
+        return list(value)
 
     def query_field(self, name: str, default: str = "") -> str:
         values = self.query.get(name, [])

@@ -1,11 +1,13 @@
-"""Baseline projections derived from the cabin registry."""
+"""Baseline projections derived from the versioned quota ledger."""
 
 from __future__ import annotations
 
-from tunnelnet.cabin import PowerBaseline, PowerBook, Registry
+from tunnelnet.cabin import PowerBaseline
+
+from .service import QuotaService
 
 
-def baseline_report(cabins: Registry, book: PowerBook) -> list[PowerBaseline]:
-    """Allocated watts for every active cabin, in registry order."""
+def baseline_report(service: QuotaService, shift_label: str = "") -> list[PowerBaseline]:
+    """Winning allocated watts for every active cabin at one shift."""
 
-    return [PowerBaseline(cabin_id=cabin.id, watts=book.baseline(cabin.id)) for cabin in cabins.active()]
+    return service.load_report(shift_label)

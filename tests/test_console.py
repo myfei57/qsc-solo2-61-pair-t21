@@ -49,7 +49,8 @@ class ConsoleCase(unittest.TestCase):
         status, health = self.call("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["kinds"], [])
+        # Seeding persists the standing baseline ledger and attributed usage.
+        self.assertEqual(set(health["kinds"]), {"quota_allocation", "quota_usage"})
 
         status, checks = self.call("GET", "/api/health/checks")
         self.assertEqual(status, 200)
@@ -462,30 +463,148 @@ class ConsoleCase(unittest.TestCase):
         self.assertGreater(health["load_factor"], 0)
 
     def test_quota_routes(self) -> None:
-        status, report = self.call("GET", "/api/quota/report")
+        day = "2026-10-05"
+        day_shift = f"{day}#0"
+        night_shift = f"{day}#1"
+        next_day_shift = "2026-10-06#0"
+        daytime = f"{day}T10:00:00Z"
+        night_time = f"{day}T21:00:00Z"
+        next_morning = f"2026-10-06T09:00:00Z"
+
+        status, report = self.call("GET", "/api/quota/report", query={"shift": [day_shift]})
         self.assertEqual(len(report["items"]), 3)
         self.assertEqual(report["book_cabins"], ["cabin-1", "cabin-2", "cabin-3"])
+        self.assertEqual({item["watts"] for item in report["items"]}, {4200.0, 3800.0, 4600.0})
 
-        status, body = self.call("POST", "/api/quota/refresh", {"watts": 1000.0})
+        # Usage during the day shift is attributed to the standing baseline.
+        status, body = self.call(
+            "POST", "/api/quota/usage", {"cabin_id": "cabin-1", "watts": 1200.0, "at": daytime}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["shift_label"], day_shift)
+        self.assertEqual(body["baseline_watts"], 4200.0)
+        status, body = self.call(
+            "POST", "/api/quota/usage", {"cabin_id": "cabin-2", "watts": 900.0, "at": daytime}
+        )
+        self.assertEqual(status, 200)
+
+        # A refresh applies from the NEXT shift; the day shift is untouched.
+        status, body = self.call("POST", "/api/quota/refresh", {"watts": 1000.0, "at": daytime})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["effective_shift"], night_shift)
         self.assertEqual([item["watts"] for item in body["items"]], [1000.0, 1000.0, 1000.0])
+        status, current = self.call("GET", "/api/quota/report", query={"shift": [day_shift]})
+        self.assertEqual({item["watts"] for item in current["items"]}, {4200.0, 3800.0, 4600.0})
+        status, upcoming = self.call("GET", "/api/quota/report", query={"shift": [night_shift]})
+        self.assertEqual({item["watts"] for item in upcoming["items"]}, {1000.0})
 
-        status, usage = self.call("GET", "/api/quota/usage")
+        status, usage = self.call("GET", "/api/quota/usage", query={"shift": [day_shift]})
         self.assertEqual(usage["usage"], {"cabin-1": 1200.0, "cabin-2": 900.0})
         self.assertEqual(usage["ranked"], ["cabin-1", "cabin-2"])
+        self.assertEqual(usage["attributed"][0]["baseline_watts"], 4200.0)
 
-        status, body = self.call("POST", "/api/quota/usage", {"cabin_id": "cabin-1", "watts": 500.0})
-        self.assertEqual(body["usage"], 1700.0)
+        # More usage after the turnover is charged against the new baseline.
+        status, body = self.call(
+            "POST", "/api/quota/usage", {"cabin_id": "cabin-1", "watts": 1500.0, "at": night_time}
+        )
+        self.assertEqual(body["shift_label"], night_shift)
+        self.assertEqual(body["baseline_watts"], 1000.0)
+        self.assertEqual(body["overage"], 500.0)
 
         status, advanced = self.call(
-            "GET", "/api/quota/advanced", query={"cabin": ["cabin-1"], "factor": ["2"]}
+            "GET",
+            "/api/quota/advanced",
+            query={"cabin": ["cabin-1"], "factor": ["2"], "shift": [night_shift]},
         )
         self.assertEqual(advanced["peak_cabin"], "cabin-1")
-        self.assertEqual(advanced["forecast"], 3400.0)
-        self.assertGreater(advanced["overage"], 0)
+        self.assertEqual(advanced["forecast"], 3000.0)
+        self.assertEqual(advanced["overage"], 500.0)
 
-        status, summary = self.call("GET", "/api/quota/summary")
+        status, summary = self.call("GET", "/api/quota/summary", query={"shift": [night_shift]})
         self.assertEqual(summary["cabins"], 3)
         self.assertEqual(summary["peak_cabin"], "cabin-1")
+        self.assertEqual(summary["shift_label"], night_shift)
+
+        # Historical attribution stays on the baseline in force that shift.
+        status, historical = self.call(
+            "GET",
+            "/api/quota/advanced",
+            query={"cabin": ["cabin-1"], "factor": ["2"], "shift": [day_shift]},
+        )
+        self.assertEqual(historical["overage"], 0.0)
+        self.assertEqual(historical["forecast"], 2400.0)
+
+        status, body = self.call("GET", "/api/export/quota/attribution", query={"shift": [next_day_shift]})
+        # No usage on the next day yet: only cabins with a carried baseline show.
+        self.assertIn("shift_label,cabin_id,baseline_watts", body)
+
+    def test_quota_allocation_idempotency_and_rollback(self) -> None:
+        daytime = "2026-10-05T10:00:00Z"
+        night_shift = "2026-10-05#1"
+
+        payload = {
+            "idempotency_key": "adj-1",
+            "at": daytime,
+            "items": [
+                {"cabin_id": "cabin-1", "watts": 5000.0},
+                {"cabin_id": "cabin-2", "watts": 3000.0},
+            ],
+        }
+        status, first = self.call("POST", "/api/quota/allocate", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(first["effective_shift"], night_shift)
+
+        # Replaying the same key returns the same batch and does not reapply.
+        status, replay = self.call("POST", "/api/quota/allocate", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(replay["batch_id"], first["batch_id"])
+        status, batches = self.call("GET", "/api/quota/batches")
+        self.assertEqual(batches["count"], 1)
+
+        # Same key with different content is a conflict.
+        conflict = dict(payload, items=[{"cabin_id": "cabin-1", "watts": 9999.0}])
+        status, body = self.call("POST", "/api/quota/allocate", conflict)
+        self.assertEqual(status, 409)
+
+        # One invalid cabin rolls the whole batch back: nothing is committed.
+        bad = {
+            "idempotency_key": "adj-2",
+            "at": daytime,
+            "items": [
+                {"cabin_id": "cabin-1", "watts": 7000.0},
+                {"cabin_id": "ghost", "watts": 1.0},
+            ],
+        }
+        status, body = self.call("POST", "/api/quota/allocate", bad)
+        self.assertEqual(status, 409)
+        status, batches = self.call("GET", "/api/quota/batches")
+        self.assertEqual(batches["count"], 1)
+
+        # Last write wins for the same cabin targeting the same future shift.
+        newer = {
+            "idempotency_key": "adj-3",
+            "at": daytime,
+            "items": [{"cabin_id": "cabin-1", "watts": 6000.0}],
+        }
+        status, body = self.call("POST", "/api/quota/allocate", newer)
+        self.assertEqual(status, 200)
+        status, report = self.call("GET", "/api/quota/report", query={"shift": [night_shift]})
+        cabin1 = next(item for item in report["items"] if item["cabin_id"] == "cabin-1")
+        self.assertEqual(cabin1["watts"], 6000.0)
+
+        # Once a shift has started it cannot be retargeted (next-shift rule).
+        late = {
+            "idempotency_key": "adj-late",
+            "at": "2026-10-05T21:30:00Z",
+            "target_shift": night_shift,
+            "items": [{"cabin_id": "cabin-1", "watts": 1.0}],
+        }
+        status, body = self.call("POST", "/api/quota/allocate", late)
+        self.assertEqual(status, 409)
+
+        status, body = self.call("GET", "/api/export/quota/allocation", query={"shift": [night_shift]})
+        self.assertIn("shift_label,cabin_id,watts,batch_id,seq", body)
+
 
     def test_audit_and_store_routes(self) -> None:
         self.call("POST", "/api/access/approve", {"cabin_id": "cabin-1", "requester": "ops"})
@@ -546,7 +665,7 @@ class ConsoleCase(unittest.TestCase):
                 "zone": "zone-1",
                 "sensor_id": "sensor-1",
                 "samples": [10.0, 20.0],
-                "at": "t",
+                "at": "2026-01-01T00:00:00Z",
                 "watts": 100.0,
             },
         )

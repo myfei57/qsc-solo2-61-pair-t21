@@ -106,11 +106,14 @@ def route_table() -> list[Route]:
         Route("POST", "/api/cables/temp", "set a cable temperature", "cable_temp"),
         Route("POST", "/api/cables/sample", "sample a cable temperature", "cable_sample"),
         Route("GET", "/api/quota/report", "baseline allocation report", "quota_report"),
-        Route("GET", "/api/quota/usage", "usage per cabin", "quota_usage"),
+        Route("GET", "/api/quota/usage", "usage per cabin for a shift", "quota_usage"),
         Route("GET", "/api/quota/advanced", "overage and forecast", "quota_advanced"),
         Route("GET", "/api/quota/summary", "quota report", "quota_summary"),
-        Route("POST", "/api/quota/refresh", "refresh the cabin baselines", "quota_refresh"),
-        Route("POST", "/api/quota/usage", "add cabin usage", "quota_add_usage"),
+        Route("POST", "/api/quota/refresh", "refresh every cabin baseline from the next shift", "quota_refresh"),
+        Route("POST", "/api/quota/allocate", "allocate per cabin baselines for the next shift", "quota_allocate"),
+        Route("GET", "/api/quota/batches", "submitted baseline adjustments", "quota_batches"),
+        Route("GET", "/api/quota/attribution", "baseline, usage and overage under one caliber", "quota_attribution"),
+        Route("POST", "/api/quota/usage", "add cabin usage attributed to its shift baseline", "quota_add_usage"),
         Route("GET", "/api/audit", "audit records", "audit_list"),
         Route("GET", "/api/audit/query", "query audit records", "audit_query"),
         Route("GET", "/api/audit/summary", "audit counters", "audit_summary"),
@@ -127,6 +130,8 @@ def route_table() -> list[Route]:
         Route("GET", "/api/export/audit", "audit trail as CSV", "export_audit"),
         Route("GET", "/api/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
         Route("GET", "/api/export/store", "store record counts as CSV", "export_store"),
+        Route("GET", "/api/export/quota/attribution", "shift attribution as CSV", "export_quota_attribution"),
+        Route("GET", "/api/export/quota/allocation", "winning shift baselines as CSV", "export_quota_allocation"),
     ]
 
 

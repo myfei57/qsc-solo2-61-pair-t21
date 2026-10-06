@@ -39,5 +39,5 @@ class Runtime:
         self.fire = FireService(store, self.ventilation, self.suppression, self.dedupe, DEFAULT_ZONES)
         self.patrol = PatrolService(self.cabins)
         self.power_book = PowerBook()
-        self.quota = QuotaService(self.cabins, self.power_book)
+        self.quota = QuotaService(self.cabins, self.power_book, repository=store)
         self.audit = AuditRegistry()
