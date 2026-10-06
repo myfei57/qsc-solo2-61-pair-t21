@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from tunnelnet.access import AccessService
 from tunnelnet.audit import AuditRegistry, MarkSet
-from tunnelnet.cabin import PartitionTable, PowerBook, Registry as CabinRegistry, SuppressionLog
+from tunnelnet.cabin import PartitionTable, Registry as CabinRegistry, SuppressionLog
 from tunnelnet.cable import CableRegistry, MovingAverage
 from tunnelnet.drain import DrainService, PumpUnit
 from tunnelnet.env import Environment
 from tunnelnet.fire import FireService
 from tunnelnet.ns import Registry as NamespaceRegistry
 from tunnelnet.patrol import PatrolService
-from tunnelnet.quota import QuotaService
+from tunnelnet.quota import AllocationLedger, QuotaService, UsageJournal
 from tunnelnet.store import Store
 from tunnelnet.vent import VentService
 
@@ -38,6 +38,7 @@ class Runtime:
         self.dedupe = MarkSet()
         self.fire = FireService(store, self.ventilation, self.suppression, self.dedupe, DEFAULT_ZONES)
         self.patrol = PatrolService(self.cabins)
-        self.power_book = PowerBook()
-        self.quota = QuotaService(self.cabins, self.power_book)
+        self.allocations = AllocationLedger(store)
+        self.usage_journal = UsageJournal(store, self.allocations)
+        self.quota = QuotaService(self.cabins, self.allocations, self.usage_journal)
         self.audit = AuditRegistry()

@@ -11,7 +11,8 @@ from tunnelnet.drain import Pit
 from tunnelnet.env import snapshot as env_snapshot
 from tunnelnet.fire import Detector
 from tunnelnet.ns import Stage, control_chain
-from tunnelnet.reporting import audit_export, telemetry_export, to_csv
+from tunnelnet.quota import next_start
+from tunnelnet.reporting import audit_export, quota_export, telemetry_export, to_csv
 from tunnelnet.reporting import store_export as store_csv_export
 from tunnelnet.store import export_all, export_kind, list_approvals, revoke_approval, summarize
 
@@ -606,23 +607,90 @@ def cable_sample(server: "Server", request: Request) -> Response:
 
 def quota_report(server: "Server", request: Request) -> Response:
     quota = server.runtime.quota
+    at = request.query_field("at") or quota.current_shift().start
     return json_response(
         {
-            "items": [baseline.as_dict() for baseline in quota.load_report()],
-            "book_cabins": server.runtime.power_book.cabins(),
+            "items": [baseline.as_dict() for baseline in quota.load_report(at)],
+            "at": at,
+            "shift": quota.current_shift(at).as_dict(),
+            "policy": quota.policy(),
+        }
+    )
+
+
+def quota_shift(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    moment = request.query_field("at") or quota.current_shift().start
+    current = quota.current_shift(moment)
+    return json_response(
+        {"current": current.as_dict(), "next_start": next_start(moment), "policy": quota.policy()}
+    )
+
+
+def quota_allocations(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    cabin_id = request.query_field("cabin")
+    return json_response(
+        {
+            "items": quota.allocation_versions(cabin_id),
+            "count": len(quota.allocation_versions(cabin_id)),
+        }
+    )
+
+
+def quota_adjust(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    raw = request.payload.get("allocations", {})
+    if not isinstance(raw, dict):
+        raise RequestError(400, "field allocations must be an object of cabin id to watts")
+    allocations = {str(key): float(value) for key, value in raw.items()}
+    result = quota.submit_adjustment(
+        allocations,
+        submitted_at=request.str_field("submitted_at"),
+        idem_key=request.str_field("idem_key"),
+        effective_at=request.str_field("effective_at"),
+    )
+    return json_response(
+        {
+            "batch_id": result.batch_id,
+            "effective_at": result.effective_at,
+            "idem_hit": result.idem_hit,
+            "policy": quota.policy(),
+            "items": [entry.as_dict() for entry in result.entries],
         }
     )
 
 
 def quota_usage(server: "Server", request: Request) -> Response:
     quota = server.runtime.quota
+    shift_start = request.query_field("shift") or quota.current_shift().start
     return json_response(
         {
-            "usage": quota.usage_by_cabin(),
-            "total": quota.total_usage(),
-            "peak": quota.peak(),
-            "ranked": quota.ranked_cabin_ids(),
-            "baseline": [baseline.as_dict() for baseline in quota.load_report()],
+            "shift": quota.current_shift(shift_start).as_dict(),
+            "usage": quota.usage_by_cabin(shift_start),
+            "total": quota.total_usage(shift_start),
+            "peak": quota.peak(shift_start),
+            "ranked": quota.ranked_cabin_ids(shift_start),
+            "baseline": [
+                baseline.as_dict() for baseline in quota.load_report(shift_start)
+            ],
+        }
+    )
+
+
+def quota_history(server: "Server", request: Request) -> Response:
+    quota = server.runtime.quota
+    cabin_id = request.query_field("cabin")
+    shift_start = request.query_field("shift")
+    rows = quota.attribution(cabin_id, shift_start)
+    usage_total, overage_total = sum(row.watts for row in rows), sum(row.overage for row in rows)
+    return json_response(
+        {
+            "items": [row.as_dict() for row in rows],
+            "count": len(rows),
+            "usage_total": usage_total,
+            "overage_total": overage_total,
+            "policy": quota.policy(),
         }
     )
 
@@ -632,13 +700,14 @@ def quota_advanced(server: "Server", request: Request) -> Response:
     cabin_id = request.query_field("cabin")
     factor = request.query_field("factor")
     scale = float(factor) if factor else 1.0
+    shift_start = quota.current_shift().start
     return json_response(
         {
             "allocated": quota.allocated(),
-            "overage_total": quota.overage_total(),
-            "peak_cabin": quota.peak_cabin(),
+            "overage_total": quota.overage_total(shift_start),
+            "peak_cabin": quota.peak_cabin(shift_start),
             "forecast": quota.forecast(cabin_id, scale),
-            "overage": quota.overage(cabin_id),
+            "overage": quota.overage(cabin_id, shift_start),
         }
     )
 
@@ -648,15 +717,24 @@ def quota_summary(server: "Server", request: Request) -> Response:
 
 
 def quota_refresh(server: "Server", request: Request) -> Response:
-    items = server.runtime.quota.refresh_baseline(request.float_field("watts"))
+    quota = server.runtime.quota
+    at = request.str_field("at")
+    moment = at or None
+    items = quota.refresh_baseline(request.float_field("watts"), at=moment or "")
     return json_response({"items": [baseline.as_dict() for baseline in items]})
 
 
 def quota_add_usage(server: "Server", request: Request) -> Response:
-    usage = server.runtime.quota.add_usage(
-        request.str_field("cabin_id"), request.float_field("watts")
+    quota = server.runtime.quota
+    entry = quota.add_usage_event(
+        request.str_field("cabin_id"),
+        request.float_field("watts"),
+        request.str_field("at"),
+        request.str_field("idem_key"),
     )
-    return json_response({"usage": usage})
+    return json_response(
+        {"entry": entry.as_dict(), "usage": quota.usage(entry.cabin_id, entry.shift_start)}
+    )
 
 
 def audit_list(server: "Server", request: Request) -> Response:
@@ -773,4 +851,9 @@ def export_telemetry(server: "Server", request: Request) -> Response:
 
 def export_store(server: "Server", request: Request) -> Response:
     columns, rows = store_csv_export(server.runtime.store)
+    return csv_response(to_csv(columns, rows))
+
+
+def export_quota(server: "Server", request: Request) -> Response:
+    columns, rows = quota_export(server.runtime.quota)
     return csv_response(to_csv(columns, rows))

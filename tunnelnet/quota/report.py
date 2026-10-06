@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,8 @@ class QuotaReport:
     overage_total: float
     peak_cabin: str
     cabins: int
+    shift: dict[str, object] = field(default_factory=dict)
+    policy: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -22,4 +24,6 @@ class QuotaReport:
             "overage_total": self.overage_total,
             "peak_cabin": self.peak_cabin,
             "cabins": self.cabins,
+            "shift": self.shift,
+            "policy": self.policy,
         }

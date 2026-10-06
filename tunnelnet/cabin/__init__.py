@@ -3,7 +3,7 @@
 from .checkpoint import Checkpoint, checkpoints
 from .model import Cabin
 from .partition import PartitionTable
-from .power import PowerBaseline, PowerBook
+from .power import PowerBaseline
 from .registry import Registry
 from .report import CabinState, RegistryState
 from .status import StatusSummary, status_summary
@@ -15,7 +15,6 @@ __all__ = [
     "Checkpoint",
     "PartitionTable",
     "PowerBaseline",
-    "PowerBook",
     "Registry",
     "RegistryState",
     "StatusSummary",

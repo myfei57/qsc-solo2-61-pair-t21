@@ -49,7 +49,10 @@ class ConsoleCase(unittest.TestCase):
         status, health = self.call("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["kinds"], [])
+        self.assertEqual(
+            health["kinds"],
+            ["quota_allocation", "quota_batch", "quota_usage"],
+        )
 
         status, checks = self.call("GET", "/api/health/checks")
         self.assertEqual(status, 200)
@@ -462,30 +465,177 @@ class ConsoleCase(unittest.TestCase):
         self.assertGreater(health["load_factor"], 0)
 
     def test_quota_routes(self) -> None:
-        status, report = self.call("GET", "/api/quota/report")
+        status, report = self.call("GET", "/api/quota/report", query={"at": ["2026-01-01T03:00:00Z"]})
+        self.assertEqual(status, 200)
         self.assertEqual(len(report["items"]), 3)
-        self.assertEqual(report["book_cabins"], ["cabin-1", "cabin-2", "cabin-3"])
-
-        status, body = self.call("POST", "/api/quota/refresh", {"watts": 1000.0})
-        self.assertEqual([item["watts"] for item in body["items"]], [1000.0, 1000.0, 1000.0])
-
-        status, usage = self.call("GET", "/api/quota/usage")
-        self.assertEqual(usage["usage"], {"cabin-1": 1200.0, "cabin-2": 900.0})
-        self.assertEqual(usage["ranked"], ["cabin-1", "cabin-2"])
-
-        status, body = self.call("POST", "/api/quota/usage", {"cabin_id": "cabin-1", "watts": 500.0})
-        self.assertEqual(body["usage"], 1700.0)
-
-        status, advanced = self.call(
-            "GET", "/api/quota/advanced", query={"cabin": ["cabin-1"], "factor": ["2"]}
+        self.assertEqual(
+            {item["cabin_id"]: item["watts"] for item in report["items"]},
+            {"cabin-1": 4200.0, "cabin-2": 3800.0, "cabin-3": 4600.0},
         )
-        self.assertEqual(advanced["peak_cabin"], "cabin-1")
-        self.assertEqual(advanced["forecast"], 3400.0)
-        self.assertGreater(advanced["overage"], 0)
+        self.assertEqual(report["policy"]["effective"], "next_shift")
+
+        status, shift = self.call("GET", "/api/quota/shift", query={"at": ["2026-01-01T03:00:00Z"]})
+        self.assertEqual(shift["current"]["start"], "2026-01-01T00:00:00Z")
+        self.assertEqual(shift["next_start"], "2026-01-01T08:00:00Z")
+
+        # Submit a per cabin allocation: durable immediately, in force at 08:00.
+        status, body = self.call(
+            "POST",
+            "/api/quota/adjust",
+            {
+                "allocations": {"cabin-1": 5000.0, "cabin-2": 4000.0},
+                "submitted_at": "2026-01-01T03:00:00Z",
+                "idem_key": "adj-1",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["effective_at"], "2026-01-01T08:00:00Z")
+        self.assertFalse(body["idem_hit"])
+        batch_id = body["batch_id"]
+
+        # Retry with the same idem key returns the original batch untouched.
+        status, retry = self.call(
+            "POST",
+            "/api/quota/adjust",
+            {
+                "allocations": {"cabin-1": 9999.0},
+                "submitted_at": "2026-01-01T03:05:00Z",
+                "idem_key": "adj-1",
+            },
+        )
+        self.assertTrue(retry["idem_hit"])
+        self.assertEqual(retry["batch_id"], batch_id)
+        self.assertEqual([item["watts"] for item in retry["items"]], [5000.0, 4000.0])
+
+        # Same cabin, same effective shift, later submission wins.
+        status, second = self.call(
+            "POST",
+            "/api/quota/adjust",
+            {
+                "allocations": {"cabin-1": 6000.0},
+                "submitted_at": "2026-01-01T04:00:00Z",
+                "idem_key": "adj-2",
+            },
+        )
+        self.assertEqual(second["effective_at"], "2026-01-01T08:00:00Z")
+
+        # Before the boundary the old baseline still resolves; after it the new.
+        status, before = self.call("GET", "/api/quota/report", query={"at": ["2026-01-01T07:59:59Z"]})
+        self.assertEqual(before["items"][0]["watts"], 4200.0)
+        status, after = self.call("GET", "/api/quota/report", query={"at": ["2026-01-01T08:00:00Z"]})
+        self.assertEqual(after["items"][0]["watts"], 6000.0)
+        self.assertEqual(after["items"][1]["watts"], 4000.0)
+
+        # Partial failure rolls the whole batch back.
+        status, failed = self.call(
+            "POST",
+            "/api/quota/adjust",
+            {
+                "allocations": {"cabin-1": 7000.0, "ghost": 1.0},
+                "submitted_at": "2026-01-02T03:00:00Z",
+                "idem_key": "adj-bad",
+            },
+        )
+        self.assertEqual(status, 400)
+        status, versions = self.call("GET", "/api/quota/allocations")
+        self.assertTrue(all(item["cabin_id"] != "ghost" for item in versions["items"]))
+
+        # Missing idem key and backdating are rejected before any write.
+        status, no_key = self.call(
+            "POST",
+            "/api/quota/adjust",
+            {"allocations": {"cabin-1": 100.0}, "submitted_at": "2026-01-02T03:00:00Z"},
+        )
+        self.assertEqual(status, 400)
+        status, backdated = self.call(
+            "POST",
+            "/api/quota/adjust",
+            {
+                "allocations": {"cabin-1": 100.0},
+                "submitted_at": "2026-01-01T09:00:00Z",
+                "effective_at": "2026-01-01T00:00:00Z",
+                "idem_key": "adj-back",
+            },
+        )
+        self.assertEqual(status, 400)
+
+        # Usage is attributed at record time to the baseline in force then.
+        status, body = self.call(
+            "POST", "/api/quota/usage",
+            {"cabin_id": "cabin-1", "watts": 5500.0, "at": "2026-01-01T07:59:00Z", "idem_key": "m-1"},
+        )
+        self.assertEqual(body["entry"]["baseline_watts"], 4200.0)
+        # Retrying the same meter event is idempotent and does not double count.
+        status, retried = self.call(
+            "POST", "/api/quota/usage",
+            {"cabin_id": "cabin-1", "watts": 5500.0, "at": "2026-01-01T07:59:30Z", "idem_key": "m-1"},
+        )
+        self.assertEqual(retried["entry"]["id"], body["entry"]["id"])
+        status, body = self.call(
+            "POST", "/api/quota/usage", {"cabin_id": "cabin-1", "watts": 5500.0, "at": "2026-01-01T08:30:00Z"}
+        )
+        self.assertEqual(body["entry"]["baseline_watts"], 6000.0)
+
+        status, history = self.call("GET", "/api/quota/history", query={"cabin": ["cabin-1"]})
+        rows = history["items"]
+        self.assertEqual([row["shift"]["start"] for row in rows], [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T08:00:00Z",
+        ])
+        night = rows[0]
+        self.assertEqual(night["watts"], 6700.0)  # seeded 1200 plus 5500
+        self.assertEqual(night["baseline_watts"], 4200.0)
+        self.assertEqual(night["overage"], 2500.0)
+        day = rows[1]
+        self.assertEqual(day["watts"], 5500.0)
+        self.assertEqual(day["baseline_watts"], 6000.0)
+        self.assertEqual(day["overage"], 0.0)
+
+        # The export carries both allocation versions and attributed usage.
+        status, csv_text = self.call("GET", "/api/export/quota")
+        self.assertEqual(status, 200)
+        self.assertIn("allocation,cabin-1", csv_text)
+        self.assertIn("usage,cabin-1,2026-01-01T08:00:00Z,B,5500.0,6000.0,0.0", csv_text)
 
         status, summary = self.call("GET", "/api/quota/summary")
         self.assertEqual(summary["cabins"], 3)
-        self.assertEqual(summary["peak_cabin"], "cabin-1")
+        self.assertEqual(summary["policy"]["same_day"], "last_submit_wins")
+
+    def test_quota_survives_restart_and_refresh(self) -> None:
+        # Adjustments and attribution are durable; reseeding never duplicates.
+        self.call(
+            "POST",
+            "/api/quota/adjust",
+            {
+                "allocations": {"cabin-1": 1000.0},
+                "submitted_at": "2026-01-02T01:00:00Z",
+                "idem_key": "durable-1",
+            },
+        )
+        self.call(
+            "POST", "/api/quota/usage", {"cabin_id": "cabin-1", "watts": 300.0, "at": "2026-01-02T02:00:00Z"}
+        )
+        restarted = Server(self.store, web_dir="web")
+        _, versions = self.call("GET", "/api/quota/allocations")
+        versions_restarted = json.loads(restarted.dispatch("GET", "/api/quota/allocations").body)
+        self.assertEqual(versions["count"], versions_restarted["count"])
+        history = json.loads(
+            restarted.dispatch(
+                "GET", "/api/quota/history", query={"cabin": ["cabin-1"], "shift": ["2026-01-02T00:00:00Z"]}
+            ).body
+        )
+        self.assertEqual(len(history["items"]), 1)
+        self.assertEqual(history["items"][0]["watts"], 300.0)
+        self.assertEqual(history["items"][0]["baseline_watts"], 4200.0)
+
+        status, body = self.call(
+            "POST", "/api/quota/refresh", {"watts": 1000.0, "at": "2026-01-03T03:00:00Z"}
+        )
+        self.assertEqual(status, 200)
+        # The report payload reflects the submitting moment; the new watts
+        # only enter force at the next shift start.
+        status, at_eight = self.call("GET", "/api/quota/report", query={"at": ["2026-01-03T08:00:00Z"]})
+        self.assertEqual({item["watts"] for item in at_eight["items"]}, {1000.0})
 
     def test_audit_and_store_routes(self) -> None:
         self.call("POST", "/api/access/approve", {"cabin_id": "cabin-1", "requester": "ops"})
@@ -546,7 +696,7 @@ class ConsoleCase(unittest.TestCase):
                 "zone": "zone-1",
                 "sensor_id": "sensor-1",
                 "samples": [10.0, 20.0],
-                "at": "t",
+                "at": "2026-01-01T12:00:00Z",
                 "watts": 100.0,
             },
         )
@@ -554,7 +704,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["reading"], 15.0)
         self.assertEqual(body["zones"], ["zone-1", "zone-2", "zone-3"])
         self.assertTrue(body["alarm_raised"])
-        self.assertEqual(body["usage"], 1300.0)
+        self.assertEqual(body["usage"], 100.0)
         self.assertEqual(body["drain_runs"], 1)
         self.assertEqual(body["audit_count"], 4)
         self.assertEqual(body["last_stage"], "audit")

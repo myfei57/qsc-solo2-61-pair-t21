@@ -10,6 +10,7 @@ from tunnelnet.store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for type checkers
     from tunnelnet.console.telemetry import Telemetry
+    from tunnelnet.quota import QuotaService
 
 QUOTE_TRIGGERS = (",", '"', "\n")
 
@@ -49,3 +50,60 @@ def telemetry_export(telemetry: Telemetry) -> tuple[list[str], list[list[object]
     """Columns and rows for the telemetry counters."""
 
     return ["metric", "value"], [[key, value] for key, value in telemetry.as_dict().items()]
+
+
+def quota_export(quota: "QuotaService") -> tuple[list[str], list[list[object]]]:
+    """Allocation versions and usage reconciled per shift, one shared basis.
+
+    Every usage row carries the exact allocation id and baseline watts it was
+    attributed to, so the export can always be tied back to one allocation
+    record and historical rows never change after later adjustments.
+    """
+
+    columns = [
+        "record",
+        "cabin_id",
+        "shift_start",
+        "shift_name",
+        "watts",
+        "baseline_watts",
+        "overage",
+        "allocation_id",
+        "batch_id",
+        "submitted_at",
+        "effective_at",
+    ]
+    rows: list[list[object]] = []
+    for entry in quota.allocation_versions():
+        rows.append(
+            [
+                "allocation",
+                entry["cabin_id"],
+                "",
+                "",
+                entry["watts"],
+                "",
+                "",
+                entry["id"],
+                entry["batch_id"],
+                entry["submitted_at"],
+                entry["effective_at"],
+            ]
+        )
+    for row in quota.attribution():
+        rows.append(
+            [
+                "usage",
+                row.cabin_id,
+                row.shift.start,
+                row.shift.name,
+                row.watts,
+                row.baseline_watts,
+                row.overage,
+                row.allocation_id,
+                "",
+                "",
+                "",
+            ]
+        )
+    return columns, rows

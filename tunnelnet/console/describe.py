@@ -20,7 +20,7 @@ def collect(rt: "Runtime") -> dict[str, str]:
         "namespaces": rt.namespaces.describe(),
         "cabins": rt.cabins.describe(),
         "partitions": rt.partitions.describe(),
-        "power": rt.power_book.describe(),
+        "power": rt.allocations.describe(),
         "access": rt.access.describe(),
         "environment": rt.env.describe(),
         "drain": rt.drain.describe(),

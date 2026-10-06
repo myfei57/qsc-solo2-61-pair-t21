@@ -106,11 +106,15 @@ def route_table() -> list[Route]:
         Route("POST", "/api/cables/temp", "set a cable temperature", "cable_temp"),
         Route("POST", "/api/cables/sample", "sample a cable temperature", "cable_sample"),
         Route("GET", "/api/quota/report", "baseline allocation report", "quota_report"),
-        Route("GET", "/api/quota/usage", "usage per cabin", "quota_usage"),
+        Route("GET", "/api/quota/shift", "current shift and next effective start", "quota_shift"),
+        Route("GET", "/api/quota/allocations", "versioned baseline allocation records", "quota_allocations"),
+        Route("POST", "/api/quota/adjust", "allocate baselines per cabin, effective next shift", "quota_adjust"),
+        Route("GET", "/api/quota/usage", "usage per cabin for a shift", "quota_usage"),
+        Route("GET", "/api/quota/history", "usage attributed with the baseline of the time", "quota_history"),
         Route("GET", "/api/quota/advanced", "overage and forecast", "quota_advanced"),
         Route("GET", "/api/quota/summary", "quota report", "quota_summary"),
-        Route("POST", "/api/quota/refresh", "refresh the cabin baselines", "quota_refresh"),
-        Route("POST", "/api/quota/usage", "add cabin usage", "quota_add_usage"),
+        Route("POST", "/api/quota/refresh", "refresh every cabin baseline for next shift", "quota_refresh"),
+        Route("POST", "/api/quota/usage", "add attributed cabin usage", "quota_add_usage"),
         Route("GET", "/api/audit", "audit records", "audit_list"),
         Route("GET", "/api/audit/query", "query audit records", "audit_query"),
         Route("GET", "/api/audit/summary", "audit counters", "audit_summary"),
@@ -127,6 +131,7 @@ def route_table() -> list[Route]:
         Route("GET", "/api/export/audit", "audit trail as CSV", "export_audit"),
         Route("GET", "/api/export/telemetry", "telemetry counters as CSV", "export_telemetry"),
         Route("GET", "/api/export/store", "store record counts as CSV", "export_store"),
+        Route("GET", "/api/export/quota", "allocations and attributed usage as CSV", "export_quota"),
     ]
 
 

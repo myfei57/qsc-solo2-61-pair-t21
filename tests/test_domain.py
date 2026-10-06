@@ -23,7 +23,6 @@ from tunnelnet.cabin import (
     Checkpoint,
     PartitionTable,
     PowerBaseline,
-    PowerBook,
     Registry as CabinRegistry,
     StatusSummary,
     SuppressionLog,
@@ -68,7 +67,21 @@ from tunnelnet.ns import Chain
 from tunnelnet.ns import Registry as NamespaceRegistry
 from tunnelnet.ns import Stage, control_chain
 from tunnelnet.patrol import CheckIn, PatrolService, overdue_cabins, progress_ratio
-from tunnelnet.quota import QuotaService, baseline_report, overage_for, peak, rank, total
+from tunnelnet.quota import (
+    AdjustmentError,
+    AllocationLedger,
+    QuotaService,
+    ShiftError,
+    UsageJournal,
+    baseline_report,
+    containing,
+    next_start,
+    overage_for,
+    peak,
+    rank,
+    shift_for_effective,
+    total,
+)
 from tunnelnet.reporting import audit_export, store_export, telemetry_export, to_csv
 from tunnelnet.store import (
     Approval,
@@ -251,15 +264,9 @@ class CabinCase(unittest.TestCase):
         self.assertEqual(table.revision(), 2)
         self.assertIn("partitions=2", table.describe())
 
-        book = PowerBook()
-        book.set_baseline("cabin-1", 4200.0)
-        book.set_baseline("cabin-2", 3800.0)
-        self.assertEqual(book.baseline("cabin-1"), 4200.0)
-        self.assertEqual(book.baseline("ghost"), 0.0)
-        self.assertEqual(book.total(), 8000.0)
-        self.assertEqual(book.cabins(), ["cabin-1", "cabin-2"])
-        self.assertIn("baselines=2", book.describe())
-        self.assertEqual(PowerBaseline("cabin-1", 4200.0).as_dict()["watts"], 4200.0)
+        book = PowerBaseline(cabin_id="cabin-1", watts=4200.0)
+        self.assertEqual(book.cabin_id, "cabin-1")
+        self.assertEqual(book.as_dict(), {"cabin_id": "cabin-1", "watts": 4200.0})
 
         log = SuppressionLog()
         log.activate("zone-1")
@@ -612,38 +619,57 @@ class CableCase(unittest.TestCase):
 
 
 class QuotaCase(unittest.TestCase):
-    def test_baselines_usage_and_overage(self) -> None:
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store.open(f"{self._tmp.name}/quota")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _service(self) -> tuple[CabinRegistry, QuotaService]:
         cabins = CabinRegistry()
         cabins.upsert(Cabin(id="cabin-1"))
         cabins.upsert(Cabin(id="cabin-2"))
-        book = PowerBook()
-        quota = QuotaService(cabins, book)
+        ledger = AllocationLedger(self.store)
+        quota = QuotaService(cabins, ledger, UsageJournal(self.store, ledger),
+                             clock=lambda: "2026-01-01T12:00:00Z")
+        quota.bootstrap({"cabin-1": 100.0, "cabin-2": 100.0}, at="2026-01-01T00:00:00Z")
+        return cabins, quota
 
-        baselines = quota.refresh_baseline(100.0)
+    def test_baselines_usage_and_overage(self) -> None:
+        cabins, quota = self._service()
+
+        baselines = quota.load_report("2026-01-01T12:00:00Z")
         self.assertEqual([item.watts for item in baselines], [100.0, 100.0])
-        self.assertEqual(book.baseline("cabin-1"), 100.0)
-        self.assertEqual([item.cabin_id for item in baseline_report(cabins, book)], ["cabin-1", "cabin-2"])
+        self.assertEqual(
+            [item.cabin_id for item in baseline_report(cabins, quota._ledger, "2026-01-01T12:00:00Z")],
+            ["cabin-1", "cabin-2"],
+        )
 
-        self.assertEqual(quota.add_usage("cabin-1", 40.0), 40.0)
-        self.assertEqual(quota.add_usage("cabin-1", 80.0), 120.0)
-        quota.add_usage("cabin-2", 50.0)
-        self.assertEqual(quota.usage("cabin-1"), 120.0)
-        self.assertEqual(quota.total_usage(), 170.0)
-        self.assertEqual(quota.peak(), 120.0)
-        self.assertEqual(quota.usage_by_cabin(), {"cabin-1": 120.0, "cabin-2": 50.0})
-        self.assertEqual(quota.ranked_cabin_ids(), ["cabin-1", "cabin-2"])
-        self.assertEqual(quota.overage("cabin-1"), 20.0)
-        self.assertEqual(quota.overage("cabin-2"), 0.0)
-        self.assertEqual(quota.allocated(), 200.0)
-        self.assertEqual(quota.overage_total(), 20.0)
+        quota.add_usage("cabin-1", 40.0, at="2026-01-01T12:00:00Z")
+        quota.add_usage("cabin-1", 80.0, at="2026-01-01T13:00:00Z")
+        quota.add_usage("cabin-2", 50.0, at="2026-01-01T13:00:00Z")
+        shift = "2026-01-01T08:00:00Z"
+        self.assertEqual(quota.usage("cabin-1", shift), 120.0)
+        self.assertEqual(quota.total_usage(shift), 170.0)
+        self.assertEqual(quota.peak(shift), 120.0)
+        self.assertEqual(quota.usage_by_cabin(shift), {"cabin-1": 120.0, "cabin-2": 50.0})
+        self.assertEqual(quota.ranked_cabin_ids(shift), ["cabin-1", "cabin-2"])
+        self.assertEqual(quota.overage("cabin-1", shift), 20.0)
+        self.assertEqual(quota.overage("cabin-2", shift), 0.0)
+        self.assertEqual(quota.allocated("2026-01-01T12:00:00Z"), 200.0)
+        self.assertEqual(quota.overage_total(shift), 20.0)
         self.assertEqual(quota.forecast("cabin-1", 2.0), 240.0)
-        self.assertEqual(quota.peak_cabin(), "cabin-1")
+        self.assertEqual(quota.peak_cabin(shift), "cabin-1")
         report = quota.report()
         self.assertEqual(report.as_dict()["cabins"], 2)
+        self.assertEqual(report.policy["effective"], "next_shift")
         self.assertIn("allocated=200.0000", quota.describe())
 
     def test_peak_cabin_without_usage(self) -> None:
-        quota = QuotaService(CabinRegistry(), PowerBook())
+        cabins = CabinRegistry()
+        ledger = AllocationLedger(self.store)
+        quota = QuotaService(cabins, ledger, UsageJournal(self.store, ledger))
         self.assertEqual(quota.peak_cabin(), "")
 
     def test_usage_helpers(self) -> None:
@@ -652,6 +678,239 @@ class QuotaCase(unittest.TestCase):
         self.assertEqual(rank({"a": 5.0, "b": 5.0}), ["a", "b"])
         self.assertEqual(overage_for(5.0, 10.0), 0.0)
         self.assertEqual(overage_for(15.0, 10.0), 5.0)
+
+class ShiftTimetableCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store.open(f"{self._tmp.name}/quota")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _ledger(self) -> AllocationLedger:
+        return AllocationLedger(self.store)
+
+    def _quota(self, *cabin_ids: str) -> tuple[CabinRegistry, QuotaService, AllocationLedger]:
+        cabins = CabinRegistry()
+        for cabin_id in cabin_ids:
+            cabins.upsert(Cabin(id=cabin_id))
+        ledger = self._ledger()
+        return cabins, QuotaService(cabins, ledger, UsageJournal(self.store, ledger)), ledger
+
+    def test_shift_boundaries_and_next_start(self) -> None:
+        day = containing("2026-01-01T03:00:00Z")
+        self.assertEqual((day.start, day.name, day.index), ("2026-01-01T00:00:00Z", "A", 0))
+        self.assertEqual(day.end, "2026-01-01T08:00:00Z")
+        self.assertEqual(containing("2026-01-01T08:00:00Z").name, "B")
+        self.assertEqual(containing("2026-01-01T15:59:59Z").name, "B")
+        self.assertEqual(containing("2026-01-01T16:00:00Z").name, "C")
+        self.assertEqual(containing("2026-01-01T23:30:00Z").start, "2026-01-01T16:00:00Z")
+
+        self.assertEqual(next_start("2026-01-01T03:00:00Z"), "2026-01-01T08:00:00Z")
+        # Exactly on a boundary: the next shift is the following boundary.
+        self.assertEqual(next_start("2026-01-01T08:00:00Z"), "2026-01-01T16:00:00Z")
+        self.assertEqual(next_start("2026-01-01T23:00:00Z"), "2026-01-02T00:00:00Z")
+
+        boundary = shift_for_effective("2026-01-01T08:00:00Z")
+        self.assertEqual(boundary.name, "B")
+        with self.assertRaises(ShiftError):
+            shift_for_effective("2026-01-01T09:00:00Z")
+        with self.assertRaises(ShiftError):
+            containing("not-a-time")
+
+    def test_adjustment_switches_at_next_shift(self) -> None:
+        cabins, quota, ledger = self._quota("cabin-1")
+        quota.bootstrap({"cabin-1": 100.0}, at="2026-01-01T00:00:00Z")
+
+        result = quota.submit_adjustment(
+            {"cabin-1": 200.0},
+            submitted_at="2026-01-01T03:00:00Z",
+            idem_key="k1",
+        )
+        self.assertEqual(result.effective_at, "2026-01-01T08:00:00Z")
+        self.assertFalse(result.idem_hit)
+
+        self.assertEqual(ledger.current("cabin-1", "2026-01-01T07:59:59Z"), 100.0)
+        self.assertEqual(ledger.current("cabin-1", "2026-01-01T08:00:00Z"), 200.0)
+
+        # Explicit effective time must be a future shift boundary.
+        with self.assertRaises(AdjustmentError):
+            quota.submit_adjustment(
+                {"cabin-1": 300.0},
+                submitted_at="2026-01-01T09:00:00Z",
+                effective_at="2026-01-01T09:30:00Z",
+                idem_key="k2",
+            )
+        with self.assertRaises(AdjustmentError):
+            quota.submit_adjustment(
+                {"cabin-1": 300.0},
+                submitted_at="2026-01-01T09:00:00Z",
+                effective_at="2026-01-01T00:00:00Z",
+                idem_key="k3",
+            )
+
+    def test_idempotent_submit_and_last_submit_wins(self) -> None:
+        cabins, quota, ledger = self._quota("cabin-1")
+        quota.bootstrap({"cabin-1": 100.0}, at="2026-01-01T00:00:00Z")
+
+        first = quota.submit_adjustment(
+            {"cabin-1": 200.0},
+            submitted_at="2026-01-01T03:00:00Z",
+            idem_key="same",
+        )
+        # Retrying the same key returns the original batch even with a new body.
+        retry = quota.submit_adjustment(
+            {"cabin-1": 999.0},
+            submitted_at="2026-01-01T03:30:00Z",
+            idem_key="same",
+        )
+        self.assertTrue(retry.idem_hit)
+        self.assertEqual(retry.batch_id, first.batch_id)
+        self.assertEqual(retry.entries[0].watts, 200.0)
+        self.assertEqual(len(ledger.entries_for("cabin-1")), 2)
+
+        # Different key, same effective shift: later submission wins.
+        quota.submit_adjustment(
+            {"cabin-1": 300.0},
+            submitted_at="2026-01-01T04:00:00Z",
+            idem_key="later",
+        )
+        self.assertEqual(ledger.current("cabin-1", "2026-01-01T08:00:00Z"), 300.0)
+        # Both versions remain on file.
+        self.assertEqual(len(ledger.entries_for("cabin-1")), 3)
+
+        # Adjusting a later shift on the same day does not overwrite.
+        quota.submit_adjustment(
+            {"cabin-1": 400.0},
+            submitted_at="2026-01-01T09:00:00Z",
+            idem_key="evening",
+        )
+        self.assertEqual(ledger.current("cabin-1", "2026-01-01T12:00:00Z"), 300.0)
+        self.assertEqual(ledger.current("cabin-1", "2026-01-01T16:00:00Z"), 400.0)
+        self.assertEqual(ledger.current("cabin-1", "2026-01-01T07:59:00Z"), 100.0)
+
+    def test_partial_failure_rolls_the_batch_back(self) -> None:
+        cabins, quota, ledger = self._quota("cabin-1")
+        quota.bootstrap({"cabin-1": 100.0}, at="2026-01-01T00:00:00Z")
+        before = len(ledger.entries_for("cabin-1"))
+
+        with self.assertRaises(AdjustmentError):
+            quota.submit_adjustment(
+                {"cabin-1": 200.0, "ghost": 5.0},
+                submitted_at="2026-01-02T03:00:00Z",
+                idem_key="mixed",
+            )
+        self.assertEqual(len(ledger.entries_for("cabin-1")), before)
+        self.assertIsNone(ledger.resolve("ghost", "2026-01-03T00:00:00Z"))
+        self.assertEqual(self.store.count("quota_batch"), 1)  # only bootstrap manifest
+
+        with self.assertRaises(AdjustmentError):
+            quota.submit_adjustment(
+                {"cabin-1": -1.0},
+                submitted_at="2026-01-02T03:00:00Z",
+                idem_key="negative",
+            )
+        with self.assertRaises(AdjustmentError):
+            quota.submit_adjustment(
+                {},
+                submitted_at="2026-01-02T03:00:00Z",
+                idem_key="empty",
+            )
+        with self.assertRaises(AdjustmentError):
+            quota.submit_adjustment(
+                {"cabin-1": 200.0},
+                submitted_at="2026-01-02T03:00:00Z",
+                idem_key="",
+            )
+
+    def test_history_keeps_the_baseline_of_the_time(self) -> None:
+        cabins, quota, ledger = self._quota("cabin-1")
+        quota.bootstrap({"cabin-1": 100.0}, at="2026-01-01T00:00:00Z")
+        quota.submit_adjustment(
+            {"cabin-1": 200.0},
+            submitted_at="2026-01-01T03:00:00Z",
+            idem_key="raise",
+        )
+
+        quota.add_usage("cabin-1", 150.0, at="2026-01-01T07:00:00Z")
+        quota.add_usage("cabin-1", 150.0, at="2026-01-01T09:00:00Z")
+
+        rows = quota.history("cabin-1")
+        self.assertEqual([row.shift.start for row in rows], [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T08:00:00Z",
+        ])
+        night, day = rows
+        self.assertEqual((night.watts, night.baseline_watts, night.overage), (150.0, 100.0, 50.0))
+        self.assertEqual((day.watts, day.baseline_watts, day.overage), (150.0, 200.0, 0.0))
+
+        # Raising the baseline again later never rewrites past attribution.
+        quota.submit_adjustment(
+            {"cabin-1": 500.0},
+            submitted_at="2026-01-02T03:00:00Z",
+            idem_key="raise-again",
+        )
+        rows = quota.history("cabin-1")
+        self.assertEqual((rows[0].watts, rows[0].baseline_watts, rows[0].overage), (150.0, 100.0, 50.0))
+
+        events = quota.events("cabin-1")
+        self.assertEqual([event.at for event in events], [
+            "2026-01-01T07:00:00Z",
+            "2026-01-01T09:00:00Z",
+        ])
+        self.assertTrue(all(event.allocation_id for event in events))
+
+    def test_usage_submit_is_idempotent(self) -> None:
+        cabins, quota, ledger = self._quota("cabin-1")
+        quota.bootstrap({"cabin-1": 100.0}, at="2026-01-01T00:00:00Z")
+
+        first = quota.add_usage_event(
+            "cabin-1", 60.0, at="2026-01-01T05:00:00Z", idem_key="meter-1"
+        )
+        duplicate = quota.add_usage_event(
+            "cabin-1", 999.0, at="2026-01-01T05:01:00Z", idem_key="meter-1"
+        )
+        self.assertEqual(duplicate.id, first.id)
+        self.assertEqual(duplicate.watts, 60.0)
+        self.assertEqual(len(quota.events("cabin-1")), 1)
+
+        # Idempotency survives a restart via the durable key records.
+        reloaded_journal = UsageJournal(self.store, AllocationLedger(self.store))
+        again = reloaded_journal.record(
+            "cabin-1", 999.0, at="2026-01-01T05:02:00Z", idem_key="meter-1"
+        )
+        self.assertEqual(again.id, first.id)
+        self.assertEqual(len(reloaded_journal.entries("cabin-1")), 1)
+
+    def test_ledger_reloads_from_disk_and_sweeps_orphans(self) -> None:
+        cabins, quota, ledger = self._quota("cabin-1")
+        store = self.store
+        quota.bootstrap({"cabin-1": 100.0}, at="2026-01-01T00:00:00Z")
+        result = quota.submit_adjustment(
+            {"cabin-1": 200.0},
+            submitted_at="2026-01-01T03:00:00Z",
+            idem_key="durable",
+        )
+
+        reloaded = AllocationLedger(store)
+        self.assertEqual(reloaded.current("cabin-1", "2026-01-01T09:00:00Z"), 200.0)
+        hit = reloaded.commit(
+            {"cabin-1": 999.0},
+            submitted_at="2026-01-01T03:30:00Z",
+            idem_key="durable",
+            effective_at=result.effective_at,
+        )
+        self.assertTrue(hit.idem_hit)
+        self.assertEqual(hit.entries[0].watts, 200.0)
+
+        # An entry without a manifest is an aborted commit and is swept.
+        entry_id = result.entries[0].id
+        self.assertTrue(store.exists("quota_allocation", entry_id))
+        store.delete("quota_batch", __import__("hashlib").sha256(b"durable").hexdigest())
+        swept = AllocationLedger(store)
+        self.assertFalse(store.exists("quota_allocation", entry_id))
+        # The swept batch disappears; the still committed bootstrap survives.
+        self.assertEqual(swept.current("cabin-1", "2026-01-01T09:00:00Z"), 100.0)
 
 
 class AuditCase(unittest.TestCase):

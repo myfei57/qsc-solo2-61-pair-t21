@@ -11,6 +11,9 @@ from .runtime import Runtime
 
 SEED_AT = "2026-01-01T00:00:00Z"
 
+SEED_BASELINES = {"cabin-1": 4200.0, "cabin-2": 3800.0, "cabin-3": 4600.0}
+SEED_USAGE = (("cabin-1", 1200.0), ("cabin-2", 900.0))
+
 
 def seed_defaults(rt: Runtime) -> None:
     """Make sure every component has a usable starting value."""
@@ -34,20 +37,23 @@ def seed_defaults(rt: Runtime) -> None:
     rt.fire.add_detector(Detector(id="detector-1", zone="zone-1"))
     rt.fire.add_detector(Detector(id="detector-2", zone="zone-2"))
 
-    rt.power_book.set_baseline("cabin-1", 4200.0)
-    rt.power_book.set_baseline("cabin-2", 3800.0)
-    rt.power_book.set_baseline("cabin-3", 4600.0)
-
     rt.cables.add(Cable(id="cable-1", cabin="cabin-1", temp=42.0))
     rt.cables.add(Cable(id="cable-2", cabin="cabin-2", temp=46.0))
+
+    # The opening baseline is a durable allocation and seeded usage is an
+    # attributed journal; both only exist on the first boot for this store,
+    # otherwise a restart would duplicate historical consumption.
+    first_boot = rt.usage_journal.count() == 0
+    rt.quota.bootstrap(SEED_BASELINES, at=SEED_AT)
 
     rt.env.sample("sensor-1", 48.0, SEED_AT)
     rt.env.sample("sensor-1", 51.0, SEED_AT)
     rt.env.sample("sensor-2", 55.0, SEED_AT)
     rt.patrol.check_in("cabin-1", SEED_AT)
     rt.patrol.set_due("cabin-2", "2025-12-31T00:00:00Z")
-    rt.quota.add_usage("cabin-1", 1200.0)
-    rt.quota.add_usage("cabin-2", 900.0)
+    if first_boot:
+        for cabin_id, watts in SEED_USAGE:
+            rt.quota.add_usage(cabin_id, watts, at=SEED_AT)
     rt.drain.record_cycle("cabin-1", SEED_AT)
     rt.drain.record_cycle("cabin-1", SEED_AT)
     rt.cables.sample("cable-1", 42.0)
